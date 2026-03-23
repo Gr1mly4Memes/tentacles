@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Mon, 23 Mar 2026 16:18:54 -0700
+Subject: [PATCH] test entity culling
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/entity_tracker/EntityCulling.java b/ca/spottedleaf/moonrise/patches/entity_tracker/EntityCulling.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a00314ce452a168c85f0ce03d2741290f7f6ff0
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/entity_tracker/EntityCulling.java
+@@ -0,0 +1,194 @@
++package ca.spottedleaf.moonrise.patches.entity_tracker;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Display;
++import net.minecraft.world.entity.EntityType;
++import net.minecraft.world.entity.decoration.ArmorStand;
++import net.minecraft.world.entity.player.Player;
++import net.minecraft.world.level.ClipContext;
++import net.minecraft.world.phys.AABB;
++import net.minecraft.world.phys.Vec3;
++import net.minecraft.world.phys.BlockHitResult;
++import net.minecraft.world.level.GameType;
++import net.minecraft.world.phys.shapes.CollisionContext;
++
++/**
++ * Entity Culling System
++ *
++ * Tracks and untracks entities out of sight of the Player entity via raytrace culling.
++ * This can greatly improve network bandwidth and client FPS.
++ *
++ * The system uses an 8-point raytrace calculation using the entity AABB (inflated by 0.3)
++ * to determine visibility.
++ */
++public final class EntityCulling {
++
++    // Inflation amount for AABB to cover edges of walls better
++    private static final double AABB_INFLATION = 0.3;
++    // Minimum distance to always show entities (don't cull very close entities)
++    private static final double MIN_DISTANCE = 3.0;
++    // Maximum distance to always cull entities (64 blocks)
++    private static final double MAX_DISTANCE = 64.0;
++    // Minimum bounding box size to never cull (20 on all 3 axes)
++    private static final double MIN_UNCULLABLE_SIZE = 20.0;
++
++    private EntityCulling() {
++    }
++
++    /**
++     * Determines if an entity should be culled (hidden) from a player's view.
++     *
++     * @param player The player (origin)
++     * @param entity The entity being checked (target)
++     * @return true if the entity should be culled, false if visible
++     */
++    public static boolean shouldCull(final ServerPlayer player, final Entity entity) {
++        // Pre-filters for vanilla compatibility
++
++        // If origin is not a real player, cull them
++        if (!((ca.spottedleaf.moonrise.patches.chunk_system.player.ChunkSystemServerPlayer) player).moonrise$isRealPlayer()) {
++            return true;
++        }
++
++        // If origin is a spectator, don't cull any entities
++        if (player.gameMode.getGameModeForPlayer() == GameType.SPECTATOR) {
++            return false;
++        }
++
++        // If target is a player in spectator mode, cull them
++        if (entity instanceof ServerPlayer targetPlayer && targetPlayer.gameMode.getGameModeForPlayer() == GameType.SPECTATOR) {
++            return true;
++        }
++
++        // If target is a player (and passed previous checks), don't cull them
++        if (entity instanceof Player) {
++            return false;
++        }
++
++        // If target is glowing, don't cull (can be seen through walls)
++        if (entity.isCurrentlyGlowing()) {
++            return false;
++        }
++
++        // If target is an invisible armor stand (marker entity), don't cull
++        if (entity instanceof ArmorStand armorStand && armorStand.isInvisible()) {
++            return false;
++        }
++
++        // If target has a custom name always visible, don't cull
++        if (entity.isCustomNameVisible() && entity.getCustomName() != null) {
++            return false;
++        }
++
++        // If target is a display entity, don't cull
++        if (entity instanceof Display) {
++            return false;
++        }
++
++        // Calculate distance between player and entity
++        final double distance = player.distanceTo(entity);
++
++        // If target is within 3 blocks, don't cull
++        if (distance <= MIN_DISTANCE) {
++            return false;
++        }
++
++        // If target is >= 64 blocks out, cull them
++        if (distance >= MAX_DISTANCE) {
++            return true;
++        }
++
++        // If target bounding box (inflated by 0.3) is greater than 20 on all 3 axes, don't cull
++        final AABB inflatedBox = entity.getBoundingBox().inflate(AABB_INFLATION);
++        if (inflatedBox.getXsize() >= MIN_UNCULLABLE_SIZE
++                && inflatedBox.getYsize() >= MIN_UNCULLABLE_SIZE
++                && inflatedBox.getZsize() >= MIN_UNCULLABLE_SIZE) {
++            return false;
++        }
++
++        // 8-point raytrace visibility check
++        // Check if player can see any point of the inflated entity AABB from their eye position
++        if (isEntityVisible(player, entity, inflatedBox, (ServerLevel) player.level())) {
++            return false;
++        }
++
++        // Entity is not visible, cull it
++        return true;
++    }
++
++    /**
++     * Checks if an entity is visible to a player using 8-point AABB raytrace.
++     *
++     * @param player The player
++     * @param entity The entity being checked
++     * @param inflatedBox The entity's inflated bounding box
++     * @param level The server level
++     * @return true if the entity is visible, false otherwise
++     */
++    private static boolean isEntityVisible(final ServerPlayer player, final Entity entity,
++                                           final AABB inflatedBox, final ServerLevel level) {
++        final Vec3 eyePos = player.getEyePosition(1.0f);
++
++        // Get 8 corners of the inflated AABB
++        final Vec3[] corners = new Vec3[] {
++                new Vec3(inflatedBox.minX, inflatedBox.minY, inflatedBox.minZ),
++                new Vec3(inflatedBox.minX, inflatedBox.minY, inflatedBox.maxZ),
++                new Vec3(inflatedBox.minX, inflatedBox.maxY, inflatedBox.minZ),
++                new Vec3(inflatedBox.minX, inflatedBox.maxY, inflatedBox.maxZ),
++                new Vec3(inflatedBox.maxX, inflatedBox.minY, inflatedBox.minZ),
++                new Vec3(inflatedBox.maxX, inflatedBox.minY, inflatedBox.maxZ),
++                new Vec3(inflatedBox.maxX, inflatedBox.maxY, inflatedBox.minZ),
++                new Vec3(inflatedBox.maxX, inflatedBox.maxY, inflatedBox.maxZ)
++        };
++
++        // Check if any corner is visible from the player's eye position
++        for (final Vec3 corner : corners) {
++            if (hasLineOfSight(eyePos, corner, level)) {
++                return true;
++            }
++        }
++
++        // Also check the entity's center point for smaller entities
++        final Vec3 center = inflatedBox.getCenter();
++        if (hasLineOfSight(eyePos, center, level)) {
++            return true;
++        }
++
++        return false;
++    }
++
++    /**
++     * Checks if there's a line of sight between two points using raytrace.
++     *
++     * @param from The starting position (player's eye)
++     * @param to The ending position (point on entity)
++     * @param level The server level
++     * @return true if there's a clear line of sight (no blocks in the way)
++     */
++    private static boolean hasLineOfSight(final Vec3 from, final Vec3 to, final ServerLevel level) {
++        final ClipContext context = new ClipContext(
++                from,
++                to,
++                ClipContext.Block.COLLIDER,
++                ClipContext.Fluid.NONE,
++                CollisionContext.empty()
++        );
++
++        final BlockHitResult result = level.clip(context);
++
++        // If the raytrace missed (returned a miss result), there's a clear line of sight
++        // If it hit something, the hit position should be very close to the target (the entity)
++        if (result.getType() == BlockHitResult.Type.MISS) {
++            return true;
++        }
++
++        // Check if the hit is close enough to the target point (within 0.1 blocks)
++        // This handles cases where the entity is partially inside a block
++        final Vec3 hitLocation = result.getLocation();
++        final double distSq = hitLocation.distanceToSqr(to);
++        return distSq < 0.01; // 0.1^2 = 0.01
++    }
++}
+diff --git a/net/minecraft/server/level/ChunkMap.java b/net/minecraft/server/level/ChunkMap.java
+index ab8893163ac85971a470e4a4d6fa76bd174e2bae..fd23e0e494aaf92f68a17c8cf3a23c97f56fd566 100644
+--- a/net/minecraft/server/level/ChunkMap.java
++++ b/net/minecraft/server/level/ChunkMap.java
+@@ -1357,6 +1357,12 @@ public class ChunkMap extends SimpleRegionStorage implements ChunkHolder.PlayerP
+         public void updatePlayer(ServerPlayer player) {
+             org.spigotmc.AsyncCatcher.catchOp("player tracker update"); // Spigot
+             if (player != this.entity) {
++                // Entity Culling check - don't track entities that can't be seen
++                if (ca.spottedleaf.moonrise.patches.entity_tracker.EntityCulling.shouldCull(player, this.entity)) {
++                    this.removePlayer(player);
++                    return;
++                }
++
+                 // Paper start - remove allocation of Vec3D here
+                 // Vec3 vec3 = player.position().subtract(this.entity.position());
+                 double vec3_dx = player.getX() - this.entity.getX();
