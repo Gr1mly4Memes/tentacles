@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Tue, 24 Mar 2026 14:49:17 -0700
+Subject: [PATCH] test-C2ME
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index c864d0ddade140309ac1a4c3fa0f043a9aff631d..9f8e24b6cc2d0398dd66049deb8e739cd11371ea 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -72,6 +72,35 @@ public final class ChunkHolderManager {
+ 
+     public static final TicketType UNLOAD_COOLDOWN = ChunkSystemTicketType.create("chunk_system:unload_cooldown", null, 5L * 20L);
+ 
++    /**
++     * Thread-local scratch lists for ticket propagation (C2ME-style: avoid allocating new lists on every distance-manager pass).
++     * Ticket updates do not nest on the same thread ({@link #BLOCK_TICKET_UPDATES}).
++     */
++    private static final ThreadLocal<ArrayList<ChunkProgressionTask>> TENTACLES_TLS_SCHEDULED_TASKS =
++        ThreadLocal.withInitial(() -> new ArrayList<>(64));
++    private static final ThreadLocal<ArrayList<NewChunkHolder>> TENTACLES_TLS_CHANGED_FULL =
++        ThreadLocal.withInitial(() -> new ArrayList<>(64));
++    private static final ThreadLocal<ArrayList<NewChunkHolder>> TENTACLES_TLS_PENDING_FULL_PASS =
++        ThreadLocal.withInitial(() -> new ArrayList<>(32));
++
++    private static ArrayList<ChunkProgressionTask> tentaclesBorrowScheduledTasks() {
++        final ArrayList<ChunkProgressionTask> list = TENTACLES_TLS_SCHEDULED_TASKS.get();
++        list.clear();
++        return list;
++    }
++
++    private static ArrayList<NewChunkHolder> tentaclesBorrowChangedFull() {
++        final ArrayList<NewChunkHolder> list = TENTACLES_TLS_CHANGED_FULL.get();
++        list.clear();
++        return list;
++    }
++
++    private static ArrayList<NewChunkHolder> tentaclesBorrowPendingFullPass() {
++        final ArrayList<NewChunkHolder> list = TENTACLES_TLS_PENDING_FULL_PASS.get();
++        list.clear();
++        return list;
++    }
++
+     private static final long NO_TIMEOUT_MARKER = Long.MIN_VALUE;
+     public final ReentrantAreaLock ticketLockArea;
+ 
+@@ -120,8 +149,8 @@ public final class ChunkHolderManager {
+     public boolean processTicketUpdates(final int chunkX, final int chunkZ) {
+         final int ticketShift = ThreadedTicketLevelPropagator.SECTION_SHIFT;
+         final int ticketMask = (1 << ticketShift) - 1;
+-        final List<ChunkProgressionTask> scheduledTasks = new ArrayList<>();
+-        final List<NewChunkHolder> changedFullStatus = new ArrayList<>();
++        final ArrayList<ChunkProgressionTask> scheduledTasks = tentaclesBorrowScheduledTasks();
++        final ArrayList<NewChunkHolder> changedFullStatus = tentaclesBorrowChangedFull();
+         final boolean ret;
+         final ReentrantAreaLock.Node ticketLock = this.ticketLockArea.lock(
+                             ((chunkX >> ticketShift) - 1) << ticketShift,
+@@ -141,6 +170,9 @@ public final class ChunkHolderManager {
+             scheduledTasks.get(i).schedule();
+         }
+ 
++        scheduledTasks.clear();
++        changedFullStatus.clear();
++
+         return ret;
+     }
+ 
+@@ -813,8 +845,8 @@ public final class ChunkHolderManager {
+ 
+         final int sectionShift = ((ChunkSystemServerLevel)this.world).moonrise$getRegionChunkShift();
+ 
+-        final List<ChunkProgressionTask> scheduledTasks = new ArrayList<>();
+-        final List<NewChunkHolder> changedFullStatus = new ArrayList<>();
++        final ArrayList<ChunkProgressionTask> scheduledTasks = new ArrayList<>(64);
++        final ArrayList<NewChunkHolder> changedFullStatus = new ArrayList<>(64);
+ 
+         Ticket[] removedList = new Ticket[4];
+ 
+@@ -1428,8 +1460,8 @@ public final class ChunkHolderManager {
+         boolean ret = false;
+ 
+         if (this.ticketLevelPropagator.hasPendingUpdates()) {
+-            final List<ChunkProgressionTask> scheduledTasks = new ArrayList<>();
+-            final List<NewChunkHolder> changedFullStatus = new ArrayList<>();
++            final ArrayList<ChunkProgressionTask> scheduledTasks = tentaclesBorrowScheduledTasks();
++            final ArrayList<NewChunkHolder> changedFullStatus = tentaclesBorrowChangedFull();
+ 
+             this.blockTicketUpdates();
+             try {
+@@ -1446,6 +1478,9 @@ public final class ChunkHolderManager {
+             for (int i = 0, len = scheduledTasks.size(); i < len; ++i) {
+                 scheduledTasks.get(i).schedule();
+             }
++
++            scheduledTasks.clear();
++            changedFullStatus.clear();
+         }
+ 
+         if (isTickThread) {
+@@ -1485,18 +1520,22 @@ public final class ChunkHolderManager {
+             return ret;
+         }
+ 
+-        final List<NewChunkHolder> changedFullStatus = new ArrayList<>();
++        final ArrayList<NewChunkHolder> changedFullStatus = tentaclesBorrowPendingFullPass();
+ 
+-        NewChunkHolder holder;
+-        while ((holder = pendingFullLoadUpdate.poll()) != null) {
+-            ret |= holder.handleFullStatusChange(changedFullStatus);
++        try {
++            NewChunkHolder holder;
++            while ((holder = pendingFullLoadUpdate.poll()) != null) {
++                ret |= holder.handleFullStatusChange(changedFullStatus);
+ 
+-            if (!changedFullStatus.isEmpty()) {
+-                for (int i = 0, len = changedFullStatus.size(); i < len; ++i) {
+-                    pendingFullLoadUpdate.add(changedFullStatus.get(i));
++                if (!changedFullStatus.isEmpty()) {
++                    for (int i = 0, len = changedFullStatus.size(); i < len; ++i) {
++                        pendingFullLoadUpdate.add(changedFullStatus.get(i));
++                    }
++                    changedFullStatus.clear();
+                 }
+-                changedFullStatus.clear();
+             }
++        } finally {
++            changedFullStatus.clear();
+         }
+ 
+         return ret;
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
+index b5b2cffbf92e0558189c68c3d644fefa1820035f..386d0663040d1536f14573cfaf4c603eda8043f6 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler.java
+@@ -62,10 +62,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.function.Consumer;
+ 
++/**
++ * Tentacles chunk scheduling follows the same design goals as
++ * <a href="https://github.com/RelativityMC/C2ME-fabric">C2ME</a> (concurrent chunk management): dedicated worker pools for
++ * parallel generation, loading, compression, saving, and asynchronous chunk I/O, coordinated with ticket-level updates.
++ * C2ME achieves this on Fabric via mixins; here Paper’s Moonrise implementation provides the pipelines below.
++ */
+ public final class ChunkTaskScheduler {
+ 
+     private static final Logger LOGGER = LogUtils.getClassLogger();
+ 
++    /**
++     * Shift passed to {@link AreaDependentQueue}: smaller values subdivide the world into more independent scheduling
++     * cells so parallel generation can use more CPU cores (same goal as C2ME’s global executor parallelism).
++     * Paper’s default is coarser; Tentacles uses {@code 1} → 2×2 chunks per cell for higher throughput on multi-core hosts.
++     */
++    private static final int TENTACLES_AREA_DEPENDENT_QUEUE_SHIFT = 1;
++
+     public static final TicketType CHUNK_LOAD = ChunkSystemTicketType.create("chunk_system:chunk_load", Long::compareTo);
+     private static final AtomicLong CHUNK_LOAD_IDS = new AtomicLong();
+ 
+@@ -277,7 +290,7 @@ public final class ChunkTaskScheduler {
+ 
+         this.parallelGenExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();
+         this.loadExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();
+-        this.radiusAwareScheduler = new AreaDependentQueue(this.parallelGenExecutor, 2); // 2 -> 4x4 grid for more parallelism
++        this.radiusAwareScheduler = new AreaDependentQueue(this.parallelGenExecutor, TENTACLES_AREA_DEPENDENT_QUEUE_SHIFT);
+         this.ioExecutor = MoonriseCommon.SERVER_IO_GROUP.createExecutor();
+         // we need a separate executor here so that on shutdown we can continue to process I/O tasks
+         this.compressionExecutor = MoonriseCommon.SERVER_GROUP.createExecutor();

@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Tue, 24 Mar 2026 15:10:05 -0700
+Subject: [PATCH] test-StructureLayoutOptimizer
+
+
+diff --git a/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutBoxOctree.java b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutBoxOctree.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..56507daf7009907ffd0bca388a885282f8318a9a
+--- /dev/null
++++ b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutBoxOctree.java
+@@ -0,0 +1,185 @@
++package net.minecraft.world.level.levelgen.structure.layoutoptimizer;
++
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.Vec3i;
++import net.minecraft.world.phys.AABB;
++
++/**
++ * Spatial index for jigsaw piece bounds (from StructureLayoutOptimizer / TelepathicGrunt).
++ * Replaces all-pairs {@link net.minecraft.world.phys.shapes.VoxelShape} checks with local queries.
++ */
++public final class StructureLayoutBoxOctree {
++
++    private static final int SUBDIVIDE_THRESHOLD = 10;
++    private static final int MAXIMUM_DEPTH = 3;
++
++    private final AABB boundary;
++    private final Vec3i size;
++    private final int depth;
++    private final List<AABB> innerBoxes = new ArrayList<>();
++    private final List<StructureLayoutBoxOctree> childrenOctants = new ArrayList<>();
++
++    public StructureLayoutBoxOctree(AABB axisAlignedBB) {
++        this(axisAlignedBB, 0);
++    }
++
++    private StructureLayoutBoxOctree(AABB axisAlignedBB, int parentDepth) {
++        this.boundary = axisAlignedBB.move(0, 0, 0);
++        this.size = new Vec3i(
++            roundAwayFromZero(this.boundary.getXsize()),
++            roundAwayFromZero(this.boundary.getYsize()),
++            roundAwayFromZero(this.boundary.getZsize())
++        );
++        this.depth = parentDepth + 1;
++    }
++
++    private static int roundAwayFromZero(double value) {
++        return value >= 0 ? (int)Math.ceil(value) : (int)Math.floor(value);
++    }
++
++    private void subdivide() {
++        if (!this.childrenOctants.isEmpty()) {
++            throw new UnsupportedOperationException("Tried to subdivide when there are already children octants.");
++        }
++
++        int halfXSize = this.size.getX() / 2;
++        int halfYSize = this.size.getY() / 2;
++        int halfZSize = this.size.getZ() / 2;
++
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX, this.boundary.minY, this.boundary.minZ, this.boundary.minX + halfXSize, this.boundary.minY + halfYSize, this.boundary.minZ + halfZSize),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX, this.boundary.minY, this.boundary.minZ + halfZSize, this.boundary.minX + halfXSize, this.boundary.minY + halfYSize, this.boundary.maxZ),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX + halfXSize, this.boundary.minY, this.boundary.minZ, this.boundary.maxX, this.boundary.minY + halfYSize, this.boundary.minZ + halfZSize),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX + halfXSize, this.boundary.minY, this.boundary.minZ + halfZSize, this.boundary.maxX, this.boundary.minY + halfYSize, this.boundary.maxZ),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX, this.boundary.minY + halfYSize, this.boundary.minZ, this.boundary.minX + halfXSize, this.boundary.maxY, this.boundary.minZ + halfZSize),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX, this.boundary.minY + halfYSize, this.boundary.minZ + halfZSize, this.boundary.minX + halfXSize, this.boundary.maxY, this.boundary.maxZ),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX + halfXSize, this.boundary.minY + halfYSize, this.boundary.minZ, this.boundary.maxX, this.boundary.maxY, this.boundary.minZ + halfZSize),
++                this.depth
++            )
++        );
++        this.childrenOctants.add(
++            new StructureLayoutBoxOctree(
++                new AABB(this.boundary.minX + halfXSize, this.boundary.minY + halfYSize, this.boundary.minZ + halfZSize, this.boundary.maxX, this.boundary.maxY, this.boundary.maxZ),
++                this.depth
++            )
++        );
++
++        for (AABB parentInnerBox : this.innerBoxes) {
++            for (StructureLayoutBoxOctree octree : this.childrenOctants) {
++                if (octree.boundaryIntersects(parentInnerBox)) {
++                    octree.addBox(parentInnerBox);
++                }
++            }
++        }
++
++        this.innerBoxes.clear();
++    }
++
++    public void addBox(AABB axisAlignedBB) {
++        if (this.depth < MAXIMUM_DEPTH && this.innerBoxes.size() > SUBDIVIDE_THRESHOLD) {
++            this.subdivide();
++        }
++
++        if (!this.childrenOctants.isEmpty()) {
++            for (StructureLayoutBoxOctree octree : this.childrenOctants) {
++                if (octree.boundaryIntersects(axisAlignedBB)) {
++                    octree.addBox(axisAlignedBB);
++                }
++            }
++        } else {
++            for (AABB parentInnerBox : this.innerBoxes) {
++                if (parentInnerBox.equals(axisAlignedBB)) {
++                    return;
++                }
++            }
++
++            this.innerBoxes.add(axisAlignedBB);
++        }
++    }
++
++    public boolean boundaryEntirelyContains(AABB axisAlignedBB) {
++        return this.boundary.contains(axisAlignedBB.minX, axisAlignedBB.minY, axisAlignedBB.minZ)
++            && this.boundary.contains(axisAlignedBB.maxX, axisAlignedBB.maxY, axisAlignedBB.maxZ);
++    }
++
++    public boolean boundaryIntersects(AABB axisAlignedBB) {
++        return this.boundary.intersects(axisAlignedBB);
++    }
++
++    public boolean withinBoundsButNotIntersectingChildren(AABB axisAlignedBB) {
++        return this.boundaryEntirelyContains(axisAlignedBB) && !this.intersectsAnyBox(axisAlignedBB);
++    }
++
++    public boolean intersectsAnyBox(AABB axisAlignedBB) {
++        if (!this.childrenOctants.isEmpty()) {
++            for (StructureLayoutBoxOctree octree : this.childrenOctants) {
++                if (octree.boundaryIntersects(axisAlignedBB) && octree.intersectsAnyBox(axisAlignedBB)) {
++                    return true;
++                }
++            }
++        } else {
++            for (AABB innerBox : this.innerBoxes) {
++                if (innerBox.intersects(axisAlignedBB)) {
++                    return true;
++                }
++            }
++        }
++
++        return false;
++    }
++
++    public boolean boundaryContains(BlockPos position) {
++        return this.boundary.contains(position.getX(), position.getY(), position.getZ());
++    }
++
++    public boolean withinAnyBox(BlockPos position) {
++        if (!this.childrenOctants.isEmpty()) {
++            for (StructureLayoutBoxOctree octree : this.childrenOctants) {
++                if (octree.boundaryContains(position) && octree.withinAnyBox(position)) {
++                    return true;
++                }
++            }
++        } else {
++            for (AABB innerBox : this.innerBoxes) {
++                if (innerBox.contains(position.getX(), position.getY(), position.getZ())) {
++                    return true;
++                }
++            }
++        }
++
++        return false;
++    }
++}
+diff --git a/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutOptimizerUtil.java b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutOptimizerUtil.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c01b3ac23fb1ccf4c0c46bb0c7bb0d72e9cc0185
+--- /dev/null
++++ b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutOptimizerUtil.java
+@@ -0,0 +1,135 @@
++package net.minecraft.world.level.levelgen.structure.layoutoptimizer;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.FrontAndTop;
++import net.minecraft.world.level.ServerLevelAccessor;
++import net.minecraft.world.level.block.JigsawBlock;
++import net.minecraft.world.level.block.Mirror;
++import net.minecraft.world.level.block.Rotation;
++import net.minecraft.world.level.block.entity.JigsawBlockEntity;
++import net.minecraft.world.level.levelgen.structure.BoundingBox;
++import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings;
++import net.minecraft.world.level.levelgen.structure.templatesystem.StructureProcessor;
++import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
++
++/**
++ * Ports key ideas from StructureLayoutOptimizer (TelepathicGrunt): faster jigsaw matching and bounded template processing.
++ */
++public final class StructureLayoutOptimizerUtil {
++
++    private static final Map<Class<?>, Boolean> FINALIZE_PROCESSING_CACHE = new ConcurrentHashMap<>();
++
++    private StructureLayoutOptimizerUtil() {
++    }
++
++    /**
++     * Same result as {@link JigsawBlock#canAttach} with fewer property lookups (StructureLayoutOptimizer).
++     */
++    public static boolean fastJigsawAttach(StructureTemplate.JigsawBlockInfo parent, StructureTemplate.JigsawBlockInfo child) {
++        FrontAndTop po = parent.info().state().getValue(JigsawBlock.ORIENTATION);
++        FrontAndTop co = child.info().state().getValue(JigsawBlock.ORIENTATION);
++        if (po.front() != co.front().getOpposite()) {
++            return false;
++        }
++        boolean rollable = parent.jointType() == JigsawBlockEntity.JointType.ROLLABLE;
++        if (!rollable && po.top() != co.top()) {
++            return false;
++        }
++        return parent.target().equals(child.name());
++    }
++
++    public static List<StructureTemplate.StructureBlockInfo> filterBlocksForPlacement(
++        StructureTemplate.Palette palette, BlockPos offset, StructurePlaceSettings structurePlaceSettings
++    ) {
++        BoundingBox boundingBox = structurePlaceSettings.getBoundingBox();
++        List<StructureTemplate.StructureBlockInfo> originalPositions = palette.blocks();
++        if (boundingBox == null) {
++            return originalPositions;
++        }
++
++        for (StructureProcessor processor : structurePlaceSettings.getProcessors()) {
++            if (Boolean.TRUE.equals(FINALIZE_PROCESSING_CACHE.computeIfAbsent(processor.getClass(), StructureLayoutOptimizerUtil::detectFinalizeProcessor))) {
++                return originalPositions;
++            }
++        }
++
++        Mirror mirror = structurePlaceSettings.getMirror();
++        Rotation rotation = structurePlaceSettings.getRotation();
++        BlockPos pivot = structurePlaceSettings.getRotationPivot();
++
++        List<StructureTemplate.StructureBlockInfo> inBounds = new ArrayList<>();
++        BlockPos.MutableBlockPos mutableBlockPos = new BlockPos.MutableBlockPos();
++
++        for (StructureTemplate.StructureBlockInfo blockInfo : originalPositions) {
++            mutableBlockPos.set(blockInfo.pos());
++            transform(mutableBlockPos, mirror, rotation, pivot);
++            mutableBlockPos.move(offset);
++
++            if (boundingBox.isInside(mutableBlockPos)) {
++                inBounds.add(blockInfo);
++            }
++        }
++
++        if (inBounds.isEmpty() && !originalPositions.isEmpty()) {
++            inBounds.add(originalPositions.get(0));
++        }
++
++        return inBounds;
++    }
++
++    private static boolean detectFinalizeProcessor(Class<?> processorClass) {
++        try {
++            var method = processorClass.getMethod(
++                "finalizeProcessing",
++                ServerLevelAccessor.class,
++                BlockPos.class,
++                BlockPos.class,
++                List.class,
++                List.class,
++                StructurePlaceSettings.class
++            );
++            return method.getDeclaringClass() != StructureProcessor.class;
++        } catch (NoSuchMethodException e) {
++            return false;
++        }
++    }
++
++    private static void transform(BlockPos.MutableBlockPos mutableBlockPos, Mirror mirror, Rotation rotation, BlockPos pivot) {
++        int i = mutableBlockPos.getX();
++        int j = mutableBlockPos.getY();
++        int k = mutableBlockPos.getZ();
++        boolean flag = true;
++        switch (mirror) {
++            case LEFT_RIGHT:
++                k = -k;
++                break;
++            case FRONT_BACK:
++                i = -i;
++                break;
++            default:
++                flag = false;
++        }
++
++        int l = pivot.getX();
++        int i1 = pivot.getZ();
++        switch (rotation) {
++            case COUNTERCLOCKWISE_90:
++                mutableBlockPos.set(l - i1 + k, j, l + i1 - i);
++                return;
++            case CLOCKWISE_90:
++                mutableBlockPos.set(l + i1 - k, j, i1 - l + i);
++                return;
++            case CLOCKWISE_180:
++                mutableBlockPos.set(l + l - i, j, i1 + i1 - k);
++                return;
++            default:
++                if (flag) {
++                    mutableBlockPos.set(i, j, k);
++                }
++        }
++    }
++}
+diff --git a/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutTrojanVoxelShape.java b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutTrojanVoxelShape.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..541eb41db095203e91696ef81e4f968f8fac9cb9
+--- /dev/null
++++ b/net/minecraft/world/level/levelgen/structure/layoutoptimizer/StructureLayoutTrojanVoxelShape.java
+@@ -0,0 +1,32 @@
++package net.minecraft.world.level.levelgen.structure.layoutoptimizer;
++
++import it.unimi.dsi.fastutil.doubles.DoubleList;
++import net.minecraft.core.Direction;
++import net.minecraft.world.phys.shapes.BitSetDiscreteVoxelShape;
++import net.minecraft.world.phys.shapes.Shapes;
++import net.minecraft.world.phys.shapes.VoxelShape;
++
++/**
++ * Holds a {@link StructureLayoutBoxOctree} while satisfying the {@link VoxelShape} type used by jigsaw placement.
++ * Based on StructureLayoutOptimizer (TelepathicGrunt).
++ */
++public final class StructureLayoutTrojanVoxelShape extends VoxelShape {
++
++    public final StructureLayoutBoxOctree boxOctree;
++
++    private static final VoxelShape EMPTY_DELEGATE = Shapes.empty();
++
++    public StructureLayoutTrojanVoxelShape(StructureLayoutBoxOctree boxOctree) {
++        super(BitSetDiscreteVoxelShape.withFilledBounds(0, 0, 0, 0, 0, 0, 0, 0, 0));
++        this.boxOctree = boxOctree;
++    }
++
++    public static StructureLayoutTrojanVoxelShape forBoundingBox(net.minecraft.world.phys.AABB aabb) {
++        return new StructureLayoutTrojanVoxelShape(new StructureLayoutBoxOctree(aabb));
++    }
++
++    @Override
++    public DoubleList getCoords(Direction.Axis axis) {
++        return EMPTY_DELEGATE.getCoords(axis);
++    }
++}
+diff --git a/net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement.java b/net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement.java
+index 12a8c5d85c9b6a433b90ae98743e78a48bf1e7d4..27e3d109602ab608ae5afa320dcacc0c231f6b38 100644
+--- a/net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement.java
++++ b/net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement.java
+@@ -30,6 +30,8 @@ import net.minecraft.world.level.levelgen.structure.BoundingBox;
+ import net.minecraft.world.level.levelgen.structure.PoolElementStructurePiece;
+ import net.minecraft.world.level.levelgen.structure.Structure;
+ import net.minecraft.world.level.levelgen.structure.StructurePiece;
++import net.minecraft.world.level.levelgen.structure.layoutoptimizer.StructureLayoutTrojanVoxelShape;
++import net.minecraft.world.level.levelgen.structure.layoutoptimizer.StructureLayoutOptimizerUtil;
+ import net.minecraft.world.level.levelgen.structure.pieces.StructurePiecesBuilder;
+ import net.minecraft.world.level.levelgen.structure.pools.alias.PoolAliasLookup;
+ import net.minecraft.world.level.levelgen.structure.structures.JigsawStructure;
+@@ -136,7 +138,9 @@ public class JigsawPlacement {
+                                     Math.min(i4 + maxDistanceFromCenter.vertical() + 1, levelHeightAccessor.getMaxY() + 1 - dimensionPadding.top()),
+                                     i1 + maxDistanceFromCenter.horizontal() + 1
+                                 );
+-                                VoxelShape voxelShape = Shapes.join(Shapes.create(aabb), Shapes.create(AABB.of(boundingBox)), BooleanOp.ONLY_FIRST);
++                                StructureLayoutTrojanVoxelShape trojanVoxelShape = StructureLayoutTrojanVoxelShape.forBoundingBox(aabb);
++                                trojanVoxelShape.boxOctree.addBox(AABB.of(boundingBox));
++                                VoxelShape voxelShape = trojanVoxelShape;
+                                 addPieces(
+                                     context.randomState(),
+                                     maxDepth,
+@@ -337,7 +341,7 @@ public class JigsawPlacement {
+                             if (isInside) {
+                                 mutableObject1 = mutableObject;
+                                 if (mutableObject.get() == null) {
+-                                    mutableObject.setValue(Shapes.create(AABB.of(boundingBox)));
++                                    mutableObject.setValue(StructureLayoutTrojanVoxelShape.forBoundingBox(AABB.of(boundingBox)));
+                                 }
+                             } else {
+                                 mutableObject1 = free;
+@@ -360,6 +364,13 @@ public class JigsawPlacement {
+                                     List<StructureTemplate.JigsawBlockInfo> shuffledJigsawBlocks = structurePoolElement.getShuffledJigsawBlocks(
+                                         this.structureTemplateManager, BlockPos.ZERO, rotation1, this.random
+                                     );
++                                    if (mutableObject1.get() instanceof StructureLayoutTrojanVoxelShape trojanForSkip) {
++                                        boolean candidateRigid = structurePoolElement.getProjection() == StructureTemplatePool.Projection.RIGID;
++                                        if (candidateRigid
++                                            && (!trojanForSkip.boxOctree.boundaryContains(blockPos1) || trojanForSkip.boxOctree.withinAnyBox(blockPos1))) {
++                                            shuffledJigsawBlocks = List.of();
++                                        }
++                                    }
+                                     BoundingBox boundingBox1 = structurePoolElement.getBoundingBox(this.structureTemplateManager, BlockPos.ZERO, rotation1);
+                                     int i2;
+                                     if (useExpansionHack && boundingBox1.getYSpan() <= 16) {
+@@ -392,7 +403,7 @@ public class JigsawPlacement {
+                                     }
+ 
+                                     for (StructureTemplate.JigsawBlockInfo jigsawBlockInfo1 : shuffledJigsawBlocks) {
+-                                        if (JigsawBlock.canAttach(jigsawBlockInfo, jigsawBlockInfo1)) {
++                                        if (StructureLayoutOptimizerUtil.fastJigsawAttach(jigsawBlockInfo, jigsawBlockInfo1)) {
+                                             BlockPos blockPos2 = jigsawBlockInfo1.info().pos();
+                                             BlockPos blockPos3 = blockPos1.subtract(blockPos2);
+                                             BoundingBox boundingBox2 = structurePoolElement.getBoundingBox(this.structureTemplateManager, blockPos3, rotation1);
+@@ -421,12 +432,25 @@ public class JigsawPlacement {
+                                                 boundingBox3.encapsulate(new BlockPos(boundingBox3.minX(), boundingBox3.minY() + max, boundingBox3.minZ()));
+                                             }
+ 
+-                                            if (!Shapes.joinIsNotEmpty(
+-                                                mutableObject1.get(), Shapes.create(AABB.of(boundingBox3).deflate(0.25)), BooleanOp.ONLY_SECOND
+-                                            )) {
+-                                                mutableObject1.setValue(
+-                                                    Shapes.joinUnoptimized(mutableObject1.get(), Shapes.create(AABB.of(boundingBox3)), BooleanOp.ONLY_FIRST)
+-                                                );
++                                            boolean pieceFits;
++                                            if (mutableObject1.get() instanceof StructureLayoutTrojanVoxelShape trojanPiece) {
++                                                pieceFits = trojanPiece.boxOctree.withinBoundsButNotIntersectingChildren(AABB.of(boundingBox3).deflate(0.25));
++                                            } else {
++                                                pieceFits =
++                                                    !Shapes.joinIsNotEmpty(
++                                                        mutableObject1.get(),
++                                                        Shapes.create(AABB.of(boundingBox3).deflate(0.25)),
++                                                        BooleanOp.ONLY_SECOND
++                                                    );
++                                            }
++                                            if (pieceFits) {
++                                                if (mutableObject1.get() instanceof StructureLayoutTrojanVoxelShape trojanAdd) {
++                                                    trojanAdd.boxOctree.addBox(AABB.of(boundingBox3));
++                                                } else {
++                                                    mutableObject1.setValue(
++                                                        Shapes.joinUnoptimized(mutableObject1.get(), Shapes.create(AABB.of(boundingBox3)), BooleanOp.ONLY_FIRST)
++                                                    );
++                                                }
+                                                 int max = piece.getGroundLevelDelta();
+                                                 int i6;
+                                                 if (flag1) {
+diff --git a/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java b/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
+index dd804657ed9935155aaaacfd5a1738df39d016e8..a71a9c3bdb9ea1dac500a741d8d3ea85449bec54 100644
+--- a/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
++++ b/net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate.java
+@@ -52,6 +52,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.minecraft.world.level.block.entity.JigsawBlockEntity;
+ import net.minecraft.world.level.block.state.BlockState;
+ import net.minecraft.world.level.levelgen.structure.BoundingBox;
++import net.minecraft.world.level.levelgen.structure.layoutoptimizer.StructureLayoutOptimizerUtil;
+ import net.minecraft.world.level.levelgen.structure.pools.StructureTemplatePool;
+ import net.minecraft.world.level.material.FluidState;
+ import net.minecraft.world.level.storage.TagValueInput;
+@@ -275,7 +276,8 @@ public class StructureTemplate {
+                 }
+             }
+             // CraftBukkit end
+-            List<StructureTemplate.StructureBlockInfo> list = settings.getRandomPalette(this.palettes, offset).blocks();
++            StructureTemplate.Palette palette = settings.getRandomPalette(this.palettes, offset);
++            List<StructureTemplate.StructureBlockInfo> list = StructureLayoutOptimizerUtil.filterBlocksForPlacement(palette, offset, settings);
+             if ((!list.isEmpty() || !settings.isIgnoreEntities() && !this.entityInfoList.isEmpty())
+                 && this.size.getX() >= 1
+                 && this.size.getY() >= 1

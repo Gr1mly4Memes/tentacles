@@ -1,0 +1,21 @@
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/package-info.java
+@@ -1,0 +_,18 @@
++/**
++ * Paper’s chunk-system rewrite (Moonrise / “chunk system”) targets the same goals as the Fabric mod
++ * <a href="https://github.com/RelativityMC/C2ME-fabric">C2ME</a> (Concurrent Chunk Management Engine):
++ * scale chunk generation, loading, and region I/O across CPU cores with explicit schedulers and priority queues.
++ * <p>
++ * C2ME wraps vanilla’s {@code ServerChunkManager} with mixins (e.g. priority scheduling, consolidated level updates).
++ * Tentacles uses this stack instead: {@link ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler}
++ * owns parallel generation, load, compression, save, and I/O executors; ticket propagation is handled by
++ * {@link ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager} and
++ * {@link ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ThreadedTicketLevelPropagator}.
++ * <p>
++ * Thread pool sizes and global limits remain in Paper’s configuration (e.g. {@code paper-global.yml}), analogous to
++ * C2ME’s module parallelism settings. Tentacles additionally uses a finer {@link ca.spottedleaf.concurrentutil.executor.queue.AreaDependentQueue}
++ * grid for generation and thread-local scratch lists in {@link ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager}
++ * to reduce allocation churn during ticket updates.
++ */
++@org.jspecify.annotations.NullMarked
++package ca.spottedleaf.moonrise.patches.chunk_system;

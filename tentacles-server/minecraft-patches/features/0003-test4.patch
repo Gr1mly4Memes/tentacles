@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Tue, 24 Mar 2026 14:31:41 -0700
+Subject: [PATCH] test4
+
+
+diff --git a/net/minecraft/world/level/block/entity/HopperBlockEntity.java b/net/minecraft/world/level/block/entity/HopperBlockEntity.java
+index 12f8105d6b12c5d63cb6e5e79435c7fd22655475..f75f43686921e47687448f6e88b40ce54435bdef 100644
+--- a/net/minecraft/world/level/block/entity/HopperBlockEntity.java
++++ b/net/minecraft/world/level/block/entity/HopperBlockEntity.java
+@@ -1,7 +1,9 @@
+ package net.minecraft.world.level.block.entity;
+ 
++import java.lang.ref.WeakReference;
+ import java.util.List;
+ import java.util.function.BooleanSupplier;
++import net.minecraft.world.CompoundContainer;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.core.NonNullList;
+@@ -22,6 +24,7 @@ import net.minecraft.world.level.Level;
+ import net.minecraft.world.level.block.Block;
+ import net.minecraft.world.level.block.ChestBlock;
+ import net.minecraft.world.level.block.HopperBlock;
++import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.minecraft.world.level.block.state.BlockState;
+ import net.minecraft.world.level.storage.ValueInput;
+ import net.minecraft.world.level.storage.ValueOutput;
+@@ -39,6 +42,12 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+     private long tickedGameTime;
+     private Direction facing;
+ 
++    /**
++     * Weak caches of resolved push/pull containers to cut repeated lookups and short-lived object churn when no hopper search API is in use.
++     */
++    private WeakReference<Container> tentaclesCachedPushContainer = new WeakReference<>(null);
++    private WeakReference<Container> tentaclesCachedPullContainer = new WeakReference<>(null);
++
+     // CraftBukkit start - add fields and methods
+     public List<org.bukkit.entity.HumanEntity> transaction = new java.util.ArrayList<>();
+     private int maxStack = MAX_STACK;
+@@ -121,6 +130,8 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+     public void setBlockState(BlockState blockState) {
+         super.setBlockState(blockState);
+         this.facing = blockState.getValue(HopperBlock.FACING);
++        this.tentaclesCachedPushContainer = new WeakReference<>(null);
++        this.tentaclesCachedPullContainer = new WeakReference<>(null);
+     }
+ 
+     @Override
+@@ -417,8 +428,37 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+     private static final java.util.function.BiPredicate<ItemStack, Integer> IS_EMPTY_TEST = (itemStack, i) -> itemStack.isEmpty();
+     // Paper end - Perf: Optimize Hoppers
+ 
++    private static boolean tentaclesIsCachedHopperContainerValid(Level level, Container container) {
++        if (container == null) {
++            return false;
++        }
++        if (container instanceof CompoundContainer compound) {
++            return tentaclesIsCachedHopperContainerValid(level, compound.container1)
++                && tentaclesIsCachedHopperContainerValid(level, compound.container2);
++        }
++        if (container instanceof BlockEntity blockEntity) {
++            return !blockEntity.isRemoved() && level.getBlockEntity(blockEntity.getBlockPos()) == blockEntity;
++        }
++        if (container instanceof Entity entity) {
++            return entity.isAlive() && !entity.isRemoved();
++        }
++        return false;
++    }
++
+     private static boolean ejectItems(Level level, BlockPos pos, HopperBlockEntity blockEntity) {
+-        Container attachedContainer = getAttachedContainer(level, pos, blockEntity);
++        Container attachedContainer = null;
++        if (org.bukkit.event.inventory.HopperInventorySearchEvent.getHandlerList().getRegisteredListeners().length == 0) {
++            final Container cached = blockEntity.tentaclesCachedPushContainer.get();
++            if (cached != null) {
++                attachedContainer = tentaclesIsCachedHopperContainerValid(level, cached) ? cached : null;
++            }
++            if (attachedContainer == null) {
++                attachedContainer = getAttachedContainer(level, pos, blockEntity);
++                blockEntity.tentaclesCachedPushContainer = new WeakReference<>(attachedContainer);
++            }
++        } else {
++            attachedContainer = getAttachedContainer(level, pos, blockEntity);
++        }
+         if (attachedContainer == null) {
+             return false;
+         } else {
+@@ -531,7 +571,21 @@ public class HopperBlockEntity extends RandomizableContainerBlockEntity implemen
+     public static boolean suckInItems(Level level, Hopper hopper) {
+         BlockPos blockPos = BlockPos.containing(hopper.getLevelX(), hopper.getLevelY() + 1.0, hopper.getLevelZ());
+         BlockState blockState = level.getBlockState(blockPos);
+-        Container sourceContainer = getSourceContainer(level, hopper, blockPos, blockState);
++        final boolean canCacheHopperContainers =
++            org.bukkit.event.inventory.HopperInventorySearchEvent.getHandlerList().getRegisteredListeners().length == 0;
++        Container sourceContainer = null;
++        if (canCacheHopperContainers && hopper instanceof HopperBlockEntity hopperBlockEntity) {
++            final Container cached = hopperBlockEntity.tentaclesCachedPullContainer.get();
++            if (cached != null) {
++                sourceContainer = tentaclesIsCachedHopperContainerValid(level, cached) ? cached : null;
++            }
++        }
++        if (sourceContainer == null) {
++            sourceContainer = getSourceContainer(level, hopper, blockPos, blockState);
++            if (canCacheHopperContainers && hopper instanceof HopperBlockEntity hopperBlockEntity) {
++                hopperBlockEntity.tentaclesCachedPullContainer = new WeakReference<>(sourceContainer);
++            }
++        }
+         if (sourceContainer != null) {
+             Direction direction = Direction.DOWN;
+             skipPullModeEventFire = skipHopperEvents; // Paper - Perf: Optimize Hoppers
+diff --git a/net/minecraft/world/level/gameevent/GameEventDispatcher.java b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+index a90db757aa65c8dcc8970bf94d856df9e8e3c769..44d3fd90b5f402435c10f6e66ed0123c41f8a24b 100644
+--- a/net/minecraft/world/level/gameevent/GameEventDispatcher.java
++++ b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.world.level.gameevent;
+ 
++import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+@@ -13,6 +14,11 @@ import net.minecraft.world.level.chunk.ChunkAccess;
+ import net.minecraft.world.phys.Vec3;
+ 
+ public class GameEventDispatcher {
++    /**
++     * Registered game event types are a small fixed set; caching the Bukkit mirror avoids repeated allocations on busy servers.
++     */
++    private static final Object2ObjectOpenHashMap<String, org.bukkit.GameEvent> TENTACLES_GAME_EVENT_CACHE = new Object2ObjectOpenHashMap<>();
++
+     private final ServerLevel level;
+ 
+     public GameEventDispatcher(ServerLevel level) {
+@@ -23,8 +29,17 @@ public class GameEventDispatcher {
+         int notificationRadius = gameEvent.value().notificationRadius();
+         BlockPos blockPos = BlockPos.containing(pos);
+         // CraftBukkit start
++        final String registeredName = gameEvent.getRegisteredName();
++        final org.bukkit.GameEvent bukkitGameEvent;
++        if (registeredName.contains("[unregistered]")) {
++            bukkitGameEvent = org.bukkit.craftbukkit.CraftGameEvent.minecraftHolderToBukkit(gameEvent);
++        } else {
++            bukkitGameEvent = TENTACLES_GAME_EVENT_CACHE.computeIfAbsent(
++                registeredName, s -> org.bukkit.craftbukkit.CraftGameEvent.minecraftHolderToBukkit(gameEvent)
++            );
++        }
+         org.bukkit.event.world.GenericGameEvent apiEvent = new org.bukkit.event.world.GenericGameEvent(
+-            org.bukkit.craftbukkit.CraftGameEvent.minecraftHolderToBukkit(gameEvent), org.bukkit.craftbukkit.util.CraftLocation.toBukkit(blockPos, this.level),
++            bukkitGameEvent, org.bukkit.craftbukkit.util.CraftLocation.toBukkit(blockPos, this.level),
+             (context.sourceEntity() == null) ? null : context.sourceEntity().getBukkitEntity(), notificationRadius, !org.bukkit.Bukkit.isPrimaryThread());
+         if (!apiEvent.callEvent()) {
+             return;
+diff --git a/net/minecraft/world/phys/Vec3.java b/net/minecraft/world/phys/Vec3.java
+index 545891c23d5d4dcae9d26ef64ec5b0bf08534d01..4de4016042049c75362ef04d47171ad3d2017b9b 100644
+--- a/net/minecraft/world/phys/Vec3.java
++++ b/net/minecraft/world/phys/Vec3.java
+@@ -4,6 +4,7 @@ import com.mojang.serialization.Codec;
+ import io.netty.buffer.ByteBuf;
+ import java.util.EnumSet;
+ import java.util.List;
++import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.core.Position;
+ import net.minecraft.core.Vec3i;
+@@ -75,6 +76,13 @@ public class Vec3 implements Position {
+         this(vector.getX(), vector.getY(), vector.getZ());
+     }
+ 
++    /**
++     * Packed block coordinates for this position, avoiding a {@link BlockPos} allocation when callers only need a spatial key.
++     */
++    public long asBlockPosLong() {
++        return BlockPos.asLong(Mth.floor(this.x), Mth.floor(this.y), Mth.floor(this.z));
++    }
++
+     public Vec3 vectorTo(Vec3 vec) {
+         return new Vec3(vec.x - this.x, vec.y - this.y, vec.z - this.z);
+     }
