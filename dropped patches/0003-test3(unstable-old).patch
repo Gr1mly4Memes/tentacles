@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Mon, 23 Mar 2026 18:19:00 -0700
+Subject: [PATCH] test3
+
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index 4af19f9f5152e9f6386e375a1ac5280ce00f48ea..ceeb72980c98b154535dc2b626d84585a226d527 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -310,7 +310,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     public boolean lagging = false; // Purpur - Lagging threshold
+     protected boolean upnp = false; // Purpur - UPnP Port Forwarding
+     // Paper start - improve tick loop
+-    public final ca.spottedleaf.moonrise.common.time.TickData tickTimes1s  = new ca.spottedleaf.moonrise.common.time.TickData(java.util.concurrent.TimeUnit.SECONDS.toNanos(1L));
++    private final ca.spottedleaf.moonrise.common.time.TickData tickTimes1s  = new ca.spottedleaf.moonrise.common.time.TickData(java.util.concurrent.TimeUnit.SECONDS.toNanos(1L));
+     public final ca.spottedleaf.moonrise.common.time.TickData tickTimes5s  = new ca.spottedleaf.moonrise.common.time.TickData(java.util.concurrent.TimeUnit.SECONDS.toNanos(5L));
+     public final ca.spottedleaf.moonrise.common.time.TickData tickTimes10s = new ca.spottedleaf.moonrise.common.time.TickData(java.util.concurrent.TimeUnit.SECONDS.toNanos(10L));
+     public final ca.spottedleaf.moonrise.common.time.TickData tickTimes15s = new ca.spottedleaf.moonrise.common.time.TickData(java.util.concurrent.TimeUnit.SECONDS.toNanos(15L));
+@@ -328,6 +328,14 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     private @Nullable double[] tps;
+     private ca.spottedleaf.moonrise.common.time.TickData.@Nullable MSPTData msptData5s;
+ 
++    // Tentacles start - Tick execution time caching for smooth lag handling
++    private final long[] cachedTickTimes = new long[20];
++    private int cachedTickTimeIndex = 0;
++    private long cachedTickTimeAverage = 50000000L; // Default 50ms (20 TPS)
++    private static final int MAX_CATCHUP_TICKS = 5; // Limit catchup to maintain smoothness
++    private static final float TICK_TIME_SMOOTHING = 0.8F;
++    // Tentacles end
++
+     private void addTickTime(final ca.spottedleaf.moonrise.common.time.TickTime time) {
+         synchronized (this.statsLock) {
+             this.tickTimes1s.addDataFrom(time);
+@@ -346,6 +354,24 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.tps = null;
+     }
+ 
++    // Tentacles start - Tick execution time caching for smooth lag handling
++    private void updateCachedTickTime(long tickTimeNanos) {
++        this.cachedTickTimes[this.cachedTickTimeIndex] = tickTimeNanos;
++        this.cachedTickTimeIndex = (this.cachedTickTimeIndex + 1) % this.cachedTickTimes.length;
++        
++        // Calculate smoothed average
++        long sum = 0;
++        for (long time : this.cachedTickTimes) {
++            sum += time;
++        }
++        long newAverage = sum / this.cachedTickTimes.length;
++        
++        // Apply smoothing to avoid sudden changes
++        this.cachedTickTimeAverage = (long)(this.cachedTickTimeAverage * TICK_TIME_SMOOTHING 
++            + newAverage * (1.0F - TICK_TIME_SMOOTHING));
++    }
++    // Tentacles end
++
+     private static double getTPS(final ca.spottedleaf.moonrise.common.time.TickData tickData, final long tickInterval) {
+         final Double avg = tickData.getTPSAverage(null, tickInterval);
+         if (avg == null) {
+@@ -1332,12 +1358,21 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+                 } else {
+                     l = this.tickRateManager.nanosecondsPerTick();
+                     // Paper start - improve tick loop
+-                    // handle catchup logic
++                    // Tentacles start - Tick execution time caching with smooth lag handling
++                    // handle catchup logic with cached tick time limits
+                     final long ticksBehind = Math.max(1L, this.tickSchedule.getPeriodsAhead(l, tickStart));
+-                    final long catchup = (long)Math.max(
+-                        1,
+-                        org.purpurmc.purpur.PurpurConfig.tpsCatchup ? 5 : 1 //ConfigHolder.getConfig().tickLoop.catchupTicks.getOrDefault(MoonriseConfig.TickLoop.DEFAULT_CATCHUP_TICKS).intValue() // Purpur - Configurable TPS Catchup
+-                    );
++                    
++                    // Use cached tick time to determine how much catchup is safe
++                    // If server is lagging, limit catchup to maintain smoothness
++                    final long cachedTickNanos = this.cachedTickTimeAverage;
++                    final long maxCatchupTicks = Math.max(1, 
++                        (int)(cachedTickNanos / l)); // How many ticks fit in our cached time budget
++                    
++                    // Configurable base catchup (vanilla: 5 with TPS catchup, 1 without)
++                    final long baseCatchup = org.purpurmc.purpur.PurpurConfig.tpsCatchup ? 5 : 1;
++                    
++                    // Use the minimum of base catchup and time-budgeted catchup for smoothness
++                    final long catchup = Math.min(baseCatchup, maxCatchupTicks);
+ 
+                     lagging = getTPS()[0] < org.purpurmc.purpur.PurpurConfig.laggingThreshold; // Purpur - Lagging threshold
+ 
+@@ -1349,6 +1384,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+ 
+                     // start next tick
+                     this.tickSchedule.advanceBy(1L, l);
++                    // Tentacles end - Tick execution time caching with smooth lag handling
+                     // Paper end - improve tick loop
+                 }
+ 
+@@ -1685,6 +1721,9 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         this.server.spark.tickEnd(((double)(endTime - this.currentTickStart) / 1000000D)); // Paper - spark
+         profilerFiller.push("tallying");
+         long l = Util.getNanos() - nanos;
++        // Tentacles start - Tick execution time caching for smooth lag handling
++        this.updateCachedTickTime(l);
++        // Tentacles end
+         int i1 = this.tickCount % 100;
+         this.aggregatedTickTimesNanos = this.aggregatedTickTimesNanos - this.tickTimesNanos[i1];
+         this.aggregatedTickTimesNanos += l;
+diff --git a/net/minecraft/server/network/PlayerChunkSender.java b/net/minecraft/server/network/PlayerChunkSender.java
+index 644948d64791d0ffa4166375d0f4419f1ffa214a..86f1befff5e8669495f0d2d66d73aa1f099fab63 100644
+--- a/net/minecraft/server/network/PlayerChunkSender.java
++++ b/net/minecraft/server/network/PlayerChunkSender.java
+@@ -54,8 +54,16 @@ public class PlayerChunkSender {
+ 
+     public void sendNextChunks(ServerPlayer player) {
+         if (this.unacknowledgedBatches < this.maxUnacknowledgedBatches) {
+-            float max = Math.max(1.0F, this.desiredChunksPerTick);
+-            this.batchQuota = Math.min(this.batchQuota + this.desiredChunksPerTick, max);
++            // Tentacles start - Elytra flight chunk loading optimization
++            float elytraBoost = 1.0F;
++            if (player.isFallFlying()) {
++                // Player is flying with elytra, increase chunk loading rate
++                elytraBoost = 2.5F;
++            }
++            // Tentacles end
++            
++            float max = Math.max(1.0F, this.desiredChunksPerTick * elytraBoost);
++            this.batchQuota = Math.min(this.batchQuota + this.desiredChunksPerTick * elytraBoost, max);
+             if (!(this.batchQuota < 1.0F)) {
+                 if (!this.pendingChunks.isEmpty()) {
+                     ServerLevel serverLevel = player.level();
+diff --git a/net/minecraft/server/network/ServerConnectionListener.java b/net/minecraft/server/network/ServerConnectionListener.java
+index 33e1cdb00d648c992af03a976899253141314b27..6ddd87b7f2666c86c7770dce98d5af1b5b83f481 100644
+--- a/net/minecraft/server/network/ServerConnectionListener.java
++++ b/net/minecraft/server/network/ServerConnectionListener.java
+@@ -90,6 +90,10 @@ public class ServerConnectionListener {
+                                 protected void initChannel(Channel channel) {
+                                     try {
+                                         channel.config().setOption(ChannelOption.TCP_NODELAY, true);
++                                        // Tentacles start - Netty optimization
++                                        channel.config().setOption(ChannelOption.SO_KEEPALIVE, true);
++                                        channel.config().setOption(ChannelOption.IP_TOS, 0x18); // IPTOS_LOWCOST | IPTOS_THROUGHPUT
++                                        // Tentacles end - Netty optimization
+                                     } catch (ChannelException var5) {
+                                     }
+ 
+@@ -146,6 +150,10 @@ public class ServerConnectionListener {
+                         .group(eventLoopGroupHolder.eventLoopGroup())
+                         .localAddress(address) // Paper - Unix domain socket support
+                         .option(ChannelOption.AUTO_READ, false) // CraftBukkit
++                        // Tentacles start - TCP FASTOPEN and backlog optimization
++                        .option(ChannelOption.SO_BACKLOG, 1024)
++                        .option(ChannelOption.TCP_FASTOPEN, 1024)
++                        // Tentacles end - TCP FASTOPEN and backlog optimization
+                         .bind()
+                         .syncUninterruptibly()
+                 );
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index 0ae6b98b71d2d1bf1cefd1b54d5402493343e0a8..169be6c98439159aa590d1387b4ea140841dc8b9 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -151,6 +151,11 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+     public boolean aware = true; // CraftBukkit
+     public net.kyori.adventure.util.TriState despawnInPeacefulOverride = net.kyori.adventure.util.TriState.NOT_SET; // Paper - allow changing despawnInPeaceful
+     public int ticksSinceLastInteraction; // Purpur - Entity lifespan
++    // Tentacles start - Pathfinding optimization
++    private int pathfindingTickCounter = 0;
++    private static final int FISH_PATHFIND_INTERVAL = 20; // Fish pathfind every 20 ticks instead of every tick
++    private static final int OUT_OF_VIEW_PATHFIND_INTERVAL = 10; // Mobs out of player view pathfind every 10 ticks
++    // Tentacles end
+ 
+     protected Mob(EntityType<? extends Mob> type, Level level) {
+         super(type, level);
+@@ -412,8 +417,51 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         if (!this.level().isClientSide() && this.tickCount % 5 == 0) {
+             this.updateControlFlags();
+         }
++        // Tentacles start - Pathfinding optimization
++        // Fish and other "useless" mobs don't need to pathfind every tick
++        this.pathfindingTickCounter++;
++        // Tentacles end
+     }
+ 
++    // Tentacles start - Pathfinding optimization
++    /**
++     * Checks if the mob should skip pathfinding this tick based on optimization settings.
++     * Fish and other mobs out of player view pathfind less frequently to reduce server load.
++     */
++    public boolean shouldSkipPathfinding() {
++        if (this.level().isClientSide()) {
++            return false;
++        }
++        
++        // Check if this is a fish type entity (water mob with simple AI)
++        boolean isFish = this.getType().is(net.minecraft.tags.EntityTypeTags.AQUATIC) 
++            || this instanceof net.minecraft.world.entity.animal.fish.AbstractFish;
++        
++        if (isFish) {
++            // Fish only pathfind every 20 ticks
++            return this.pathfindingTickCounter % FISH_PATHFIND_INTERVAL != 0;
++        }
++        
++        // Check if mob is far from any player (out of visibility)
++        boolean outOfView = true;
++        if (this.level() instanceof ServerLevel serverLevel) {
++            for (Player player : serverLevel.players()) {
++                if (player.distanceToSqr(this) < 1024.0) { // 32 blocks squared
++                    outOfView = false;
++                    break;
++                }
++            }
++        }
++        
++        if (outOfView) {
++            // Mobs out of player view only pathfind every 10 ticks
++            return this.pathfindingTickCounter % OUT_OF_VIEW_PATHFIND_INTERVAL != 0;
++        }
++        
++        return false;
++    }
++    // Tentacles end
++
+     protected void updateControlFlags() {
+         boolean flag = !(this.getControllingPassenger() instanceof Mob);
+         boolean flag1 = !(this.getVehicle() instanceof AbstractBoat);
+diff --git a/net/minecraft/world/level/block/CropBlock.java b/net/minecraft/world/level/block/CropBlock.java
+index 372559399ce8a4ce551f4403975879e365e1ad75..b38328cd77a7e3d9e419d1fcc6b6feda71a9fdf3 100644
+--- a/net/minecraft/world/level/block/CropBlock.java
++++ b/net/minecraft/world/level/block/CropBlock.java
+@@ -79,6 +79,13 @@ public class CropBlock extends VegetationBlock implements BonemealableBlock {
+         if (level.getRawBrightness(pos, 0) >= 9) {
+             int age = this.getAge(state);
+             if (age < this.getMaxAge()) {
++                // Tentacles start - Adaptive ticking for plant growth under heavy load
++                // If server is lagging, slow down plant growth to allow server to recover
++                if (level.getServer().lagging && random.nextFloat() < 0.5f) {
++                    return; // Skip growth tick when server is under heavy load
++                }
++                // Tentacles end
++                
+                 float growthSpeed = getGrowthSpeed(this, level, pos);
+                 // Spigot start
+                 int modifier = 100;

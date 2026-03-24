@@ -35,8 +35,6 @@ for (name in listOf("tentacles-api", "tentacles-server")) {
     findProject(":$projName")!!.projectDir = file(name)
 }
 
-optionalInclude("test-plugin")
-
 fun optionalInclude(name: String, op: (ProjectDescriptor.() -> Unit)? = null) {
     val settingsFile = file("$name.settings.gradle.kts")
     if (settingsFile.exists()) {

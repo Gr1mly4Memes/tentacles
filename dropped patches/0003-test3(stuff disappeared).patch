@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Mon, 23 Mar 2026 19:45:24 -0700
+Subject: [PATCH] test3
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizer.java b/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0caad8ecf8276ca860d715cdf51b3f713f90c590
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizer.java
+@@ -0,0 +1,349 @@
++package ca.spottedleaf.moonrise.patches.chunk_system.lod;
++
++import ca.spottedleaf.concurrentutil.util.Priority;
++import it.unimi.dsi.fastutil.longs.Long2IntMap;
++import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
++import it.unimi.dsi.fastutil.longs.LongSet;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.level.ChunkPos;
++import net.minecraft.world.level.chunk.ChunkAccess;
++import net.minecraft.world.level.chunk.ProtoChunk;
++import net.minecraft.world.level.chunk.status.ChunkStatus;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.concurrent.ConcurrentLinkedQueue;
++
++/**
++ * Tentacles - LOD Terrain, Lazy Feature Generation, and Lighting Deferral
++ *
++ * This system implements three major optimizations:
++ * 1. LOD Terrain: Far chunks generate with reduced noise detail
++ * 2. Lazy Feature Generation: Trees/ores/structures generate only when player is near
++ * 3. Lighting Deferral: Lighting is computed only when chunk is near player
++ */
++public class ChunkGenerationOptimizer {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Tentacles-ChunkOpt");
++
++    // LOD Levels
++    public static final int LOD_FULL = 0;      // Full detail - within 6 chunks
++    public static final int LOD_MEDIUM = 1;    // Medium detail - 6-12 chunks
++    public static final int LOD_FAR = 2;       // Low detail - beyond 12 chunks
++
++    // Distance thresholds (in chunks)
++    private static final int LOD_MEDIUM_DISTANCE = 6;
++    private static final int LOD_FAR_DISTANCE = 12;
++    private static final int FEATURE_GENERATION_DISTANCE = 2;
++    private static final int LIGHTING_DEFERRAL_DISTANCE = 3;
++
++    // Tracking pending operations
++    private final Long2IntMap chunkLODLevels = new Long2IntOpenHashMap();
++    private final LongSet featuresPending = new LongOpenHashSet();
++    private final LongSet lightingPending = new LongOpenHashSet();
++    private final LongSet structuresPending = new LongOpenHashSet(); // Track structure generation
++    private final ConcurrentLinkedQueue<Long> pendingFeatureQueue = new ConcurrentLinkedQueue<>();
++    private final ConcurrentLinkedQueue<Long> pendingLightingQueue = new ConcurrentLinkedQueue<>();
++
++    private final ServerLevel level;
++
++    public ChunkGenerationOptimizer(ServerLevel level) {
++        this.level = level;
++        this.chunkLODLevels.defaultReturnValue(LOD_FULL);
++    }
++
++    /**
++     * Calculate LOD level for a chunk based on distance from nearest player
++     */
++    public int calculateLODLevel(ChunkPos pos) {
++        int minDistance = Integer.MAX_VALUE;
++
++        for (ServerPlayer player : this.level.players()) {
++            ChunkPos playerPos = player.chunkPosition();
++            int dx = Math.abs(pos.x - playerPos.x);
++            int dz = Math.abs(pos.z - playerPos.z);
++            int dist = Math.max(dx, dz); // Chebyshev distance
++            minDistance = Math.min(minDistance, dist);
++        }
++
++        if (minDistance > LOD_FAR_DISTANCE) {
++            return LOD_FAR;
++        } else if (minDistance > LOD_MEDIUM_DISTANCE) {
++            return LOD_MEDIUM;
++        }
++        return LOD_FULL;
++    }
++
++    /**
++     * Get cached or calculate LOD level for chunk
++     */
++    public int getLODLevel(ChunkPos pos) {
++        long chunkKey = pos.toLong();
++        int lod = this.chunkLODLevels.get(chunkKey);
++        if (lod == LOD_FULL && !this.chunkLODLevels.containsKey(chunkKey)) {
++            lod = calculateLODLevel(pos);
++            this.chunkLODLevels.put(chunkKey, lod);
++        }
++        return lod;
++    }
++
++    /**
++     * Mark chunk as needing feature generation
++     */
++    public void markFeaturesPending(ChunkPos pos) {
++        long chunkKey = pos.toLong();
++        if (this.featuresPending.add(chunkKey)) {
++            this.pendingFeatureQueue.add(chunkKey);
++            LOGGER.debug("Marked features pending for chunk {}", pos);
++        }
++    }
++
++    /**
++     * Check if features should generate for this chunk
++     */
++    public boolean shouldGenerateFeaturesNow(ChunkPos pos) {
++        // Always generate features if chunk is close to any player
++        for (ServerPlayer player : this.level.players()) {
++            ChunkPos playerPos = player.chunkPosition();
++            int dx = Math.abs(pos.x - playerPos.x);
++            int dz = Math.abs(pos.z - playerPos.z);
++            if (Math.max(dx, dz) <= FEATURE_GENERATION_DISTANCE) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Check if features are pending for this chunk
++     */
++    public boolean isFeaturesPending(ChunkPos pos) {
++        return this.featuresPending.contains(pos.toLong());
++    }
++
++    /**
++     * Mark features as generated for chunk
++     */
++    public void markFeaturesGenerated(ChunkPos pos) {
++        long chunkKey = pos.toLong();
++        this.featuresPending.remove(chunkKey);
++        this.pendingFeatureQueue.remove(chunkKey);
++    }
++
++    /**
++     * Mark chunk as needing lighting
++     */
++    public void markLightingPending(ChunkPos pos) {
++        long chunkKey = pos.toLong();
++        if (this.lightingPending.add(chunkKey)) {
++            this.pendingLightingQueue.add(chunkKey);
++        }
++    }
++
++    /**
++     * Check if lighting should be computed now for this chunk
++     */
++    public boolean shouldLightNow(ChunkPos pos) {
++        // Light chunks that are close to players
++        for (ServerPlayer player : this.level.players()) {
++            ChunkPos playerPos = player.chunkPosition();
++            int dx = Math.abs(pos.x - playerPos.x);
++            int dz = Math.abs(pos.z - playerPos.z);
++            if (Math.max(dx, dz) <= LIGHTING_DEFERRAL_DISTANCE) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Check if lighting is pending for this chunk
++     */
++    public boolean isLightingPending(ChunkPos pos) {
++        return this.lightingPending.contains(pos.toLong());
++    }
++
++    /**
++     * Mark lighting as completed for chunk
++     */
++    public void markLightingDone(ChunkPos pos) {
++        long chunkKey = pos.toLong();
++        this.lightingPending.remove(chunkKey);
++        this.pendingLightingQueue.remove(chunkKey);
++    }
++
++    /**
++     * Process pending feature and lighting generation
++     * Call this periodically from tick
++     */
++    public void processPendingOperations() {
++        // Process up to 4 feature generations per tick
++        int featuresProcessed = 0;
++        Long chunkKey;
++        while ((chunkKey = this.pendingFeatureQueue.poll()) != null && featuresProcessed < 4) {
++            if (!this.featuresPending.contains(chunkKey)) {
++                continue; // Already processed
++            }
++
++            ChunkPos pos = new ChunkPos(chunkKey);
++            if (shouldGenerateFeaturesNow(pos)) {
++                generateFeaturesForChunk(pos);
++                featuresProcessed++;
++            } else {
++                // Put back in queue if not ready
++                this.pendingFeatureQueue.add(chunkKey);
++                break; // Stop processing if we hit a non-ready chunk
++            }
++        }
++
++        // Process up to 2 lighting operations per tick
++        int lightingProcessed = 0;
++        while ((chunkKey = this.pendingLightingQueue.poll()) != null && lightingProcessed < 2) {
++            if (!this.lightingPending.contains(chunkKey)) {
++                continue; // Already processed
++            }
++
++            ChunkPos pos = new ChunkPos(chunkKey);
++            if (shouldLightNow(pos)) {
++                lightChunk(pos);
++                lightingProcessed++;
++            } else {
++                // Put back in queue if not ready
++                this.pendingLightingQueue.add(chunkKey);
++                break;
++            }
++        }
++    }
++
++    /**
++     * Generate features for a chunk (called when player approaches)
++     */
++    private void generateFeaturesForChunk(ChunkPos pos) {
++        ChunkAccess chunk = this.level.getChunkSource().getChunk(pos.x, pos.z, false);
++        if (!(chunk instanceof ProtoChunk protoChunk)) {
++            this.markFeaturesGenerated(pos);
++            return;
++        }
++
++        // Check if already has features
++        if (protoChunk.getPersistedStatus().isOrAfter(ChunkStatus.FEATURES)) {
++            this.markFeaturesGenerated(pos);
++            return;
++        }
++
++        LOGGER.debug("Generating deferred features for chunk {}", pos);
++
++        try {
++            // Schedule feature generation through chunk system
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.level)
++                .moonrise$getChunkTaskScheduler()
++                .scheduleChunkLoad(pos.x, pos.z, ChunkStatus.FEATURES, false,
++                    Priority.NORMAL,
++                    loadedChunk -> {});
++
++            this.markFeaturesGenerated(pos);
++        } catch (Exception e) {
++            LOGGER.error("Failed to generate features for chunk {}", pos, e);
++        }
++    }
++
++    /**
++     * Light a chunk (called when player approaches)
++     */
++    private void lightChunk(ChunkPos pos) {
++        ChunkAccess chunk = this.level.getChunkSource().getChunk(pos.x, pos.z, false);
++        if (chunk == null) {
++            this.markLightingDone(pos);
++            return;
++        }
++
++        if (chunk.getPersistedStatus().isOrAfter(ChunkStatus.LIGHT)) {
++            this.markLightingDone(pos);
++            return;
++        }
++
++        LOGGER.debug("Computing deferred lighting for chunk {}", pos);
++
++        try {
++            // Schedule lighting through chunk system
++            ((ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel)this.level)
++                .moonrise$getChunkTaskScheduler()
++                .scheduleChunkLoad(pos.x, pos.z, ChunkStatus.LIGHT, false,
++                    Priority.NORMAL,
++                    litChunk -> {});
++
++            this.markLightingDone(pos);
++        } catch (Exception e) {
++            LOGGER.error("Failed to light chunk {}", pos, e);
++        }
++    }
++
++    /**
++     * Update LOD levels for all chunks based on current player positions
++     * Call this periodically
++     */
++    public void updateLODLevels() {
++        // Clear and recalculate
++        this.chunkLODLevels.clear();
++
++        // Pre-calculate for chunks near players
++        for (ServerPlayer player : this.level.players()) {
++            ChunkPos playerPos = player.chunkPosition();
++
++            // Update LOD for chunks in range
++            for (int dx = -LOD_FAR_DISTANCE; dx <= LOD_FAR_DISTANCE; dx++) {
++                for (int dz = -LOD_FAR_DISTANCE; dz <= LOD_FAR_DISTANCE; dz++) {
++                    ChunkPos pos = new ChunkPos(playerPos.x + dx, playerPos.z + dz);
++                    int dist = Math.max(Math.abs(dx), Math.abs(dz));
++
++                    int lod;
++                    if (dist > LOD_FAR_DISTANCE) lod = LOD_FAR;
++                    else if (dist > LOD_MEDIUM_DISTANCE) lod = LOD_MEDIUM;
++                    else lod = LOD_FULL;
++
++                    long chunkKey = pos.toLong();
++                    int currentLod = this.chunkLODLevels.get(chunkKey);
++                    // Only store if different from default or higher detail needed
++                    if (lod != LOD_FULL || currentLod != LOD_FULL) {
++                        this.chunkLODLevels.put(chunkKey, lod);
++                    }
++                }
++            }
++        }
++    }
++
++    /**
++     * Check if a chunk should skip structure generation at its current LOD level
++     */
++    public boolean shouldSkipStructures(ChunkPos pos) {
++        int lod = getLODLevel(pos);
++        return lod >= LOD_MEDIUM; // Skip structures in medium and far LOD
++    }
++
++    /**
++     * Mark structures as pending for later generation
++     */
++    public void markStructuresPending(ChunkPos pos) {
++        this.structuresPending.add(pos.toLong());
++    }
++
++    /**
++     * Get pending chunk count for debug
++     */
++    public int getPendingFeatureCount() {
++        return this.featuresPending.size();
++    }
++
++    public int getPendingLightingCount() {
++        return this.lightingPending.size();
++    }
++
++    public int getPendingStructureCount() {
++        return this.structuresPending.size();
++    }
++}
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizerManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizerManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf57475663ba036598b18d63ebbfc364c1469130
+--- /dev/null
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/lod/ChunkGenerationOptimizerManager.java
+@@ -0,0 +1,62 @@
++package ca.spottedleaf.moonrise.patches.chunk_system.lod;
++
++import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
++import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
++import net.minecraft.server.level.ServerLevel;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Manages ChunkGenerationOptimizer instances per level
++ */
++public class ChunkGenerationOptimizerManager {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger("Tentacles-ChunkOpt");
++    private static final Object2ObjectMap<ServerLevel, ChunkGenerationOptimizer> optimizers = new Object2ObjectOpenHashMap<>();
++
++    /**
++     * Get or create optimizer for a level
++     */
++    public static ChunkGenerationOptimizer getForLevel(ServerLevel level) {
++        return optimizers.computeIfAbsent(level, ChunkGenerationOptimizer::new);
++    }
++
++    /**
++     * Remove optimizer for a level (called when level unloads)
++     */
++    public static void removeForLevel(ServerLevel level) {
++        optimizers.remove(level);
++    }
++
++    /**
++     * Tick all optimizers - call from ServerLevel tick
++     */
++    public static void tickAll() {
++        for (ChunkGenerationOptimizer optimizer : optimizers.values()) {
++            try {
++                optimizer.updateLODLevels();
++                optimizer.processPendingOperations();
++            } catch (Exception e) {
++                LOGGER.error("Error ticking chunk generation optimizer", e);
++            }
++        }
++    }
++
++    /**
++     * Get debug info for all optimizers
++     */
++    public static String getDebugInfo() {
++        StringBuilder sb = new StringBuilder();
++        sb.append("Chunk Generation Optimizers:\n");
++        for (Object2ObjectMap.Entry<ServerLevel, ChunkGenerationOptimizer> entry : optimizers.object2ObjectEntrySet()) {
++            ServerLevel level = entry.getKey();
++            ChunkGenerationOptimizer optimizer = entry.getValue();
++            sb.append("  ").append(level.dimension().identifier())
++              .append(" - Pending Features: ").append(optimizer.getPendingFeatureCount())
++              .append(", Pending Lighting: ").append(optimizer.getPendingLightingCount())
++              .append(", Pending Structures: ").append(optimizer.getPendingStructureCount())
++              .append("\n");
++        }
++        return sb.toString();
++    }
++}
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 853bb92c034b6361ff8c55daf52f38a226fdae2c..74e22b3238ee823bcdb6f23b59b144018b6ce808 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -898,6 +898,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+         this.debugSynchronizers.tick(this.server.debugSubscribers());
+         profilerFiller.pop();
+         this.environmentAttributes().invalidateTickCache();
++
++        // Tentacles start - LOD Terrain, Lazy Feature Generation, Lighting Deferral
++        // Process pending chunk operations once per tick
++        ca.spottedleaf.moonrise.patches.chunk_system.lod.ChunkGenerationOptimizerManager.tickAll();
++        // Tentacles end
+     }
+ 
+     @Override
+diff --git a/net/minecraft/world/level/chunk/status/ChunkStatusTasks.java b/net/minecraft/world/level/chunk/status/ChunkStatusTasks.java
+index 28061d7e710e6e4263b02231c5b7f06bfc0252e4..d2b9b97596200c23209795fc9e470cbd5e561a88 100644
+--- a/net/minecraft/world/level/chunk/status/ChunkStatusTasks.java
++++ b/net/minecraft/world/level/chunk/status/ChunkStatusTasks.java
+@@ -42,15 +42,26 @@ public class ChunkStatusTasks {
+     ) {
+         ServerLevel serverLevel = worldGenContext.level();
+         if (serverLevel.serverLevelData.worldGenOptions().generateStructures()) { // CraftBukkit
+-            worldGenContext.generator()
+-                .createStructures(
+-                    serverLevel.registryAccess(),
+-                    serverLevel.getChunkSource().getGeneratorState(),
+-                    serverLevel.structureManager(),
+-                    chunk,
+-                    worldGenContext.structureManager(),
+-                    serverLevel.dimension()
+-                );
++            // Tentacles start - LOD-aware structure generation skip
++            // Skip structure generation for far chunks to reduce CPU load
++            var optimizer = ca.spottedleaf.moonrise.patches.chunk_system.lod.ChunkGenerationOptimizerManager.getForLevel(serverLevel);
++            ChunkPos pos = chunk.getPos();
++            if (optimizer != null && optimizer.shouldSkipStructures(pos)) {
++                // Mark structures as pending for later generation
++                optimizer.markStructuresPending(pos);
++            } else {
++                // Generate structures normally
++                worldGenContext.generator()
++                    .createStructures(
++                        serverLevel.registryAccess(),
++                        serverLevel.getChunkSource().getGeneratorState(),
++                        serverLevel.structureManager(),
++                        chunk,
++                        worldGenContext.structureManager(),
++                        serverLevel.dimension()
++                    );
++            }
++            // Tentacles end - LOD-aware structure generation skip
+         }
+ 
+         serverLevel.onStructureStartsAvailable(chunk);
+@@ -143,6 +154,33 @@ public class ChunkStatusTasks {
+         WorldGenContext worldGenContext, ChunkStep step, StaticCache2D<GenerationChunkHolder> cache, ChunkAccess chunk
+     ) {
+         ServerLevel serverLevel = worldGenContext.level();
++
++        // Tentacles start - Lazy Feature Generation
++        // Defer feature generation for chunks far from players
++        var optimizer = ca.spottedleaf.moonrise.patches.chunk_system.lod.ChunkGenerationOptimizerManager.getForLevel(serverLevel);
++        if (optimizer != null) {
++            ChunkPos pos = chunk.getPos();
++
++            // Check if we should generate features now or defer
++            if (!optimizer.shouldGenerateFeaturesNow(pos)) {
++                // Mark features as pending for later generation
++                optimizer.markFeaturesPending(pos);
++
++                // Still prime heightmaps for basic functionality
++                Heightmap.primeHeightmaps(
++                    chunk,
++                    EnumSet.of(Heightmap.Types.MOTION_BLOCKING, Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, Heightmap.Types.OCEAN_FLOOR, Heightmap.Types.WORLD_SURFACE)
++                );
++
++                // Return chunk without features - they'll be generated when player approaches
++                return CompletableFuture.completedFuture(chunk);
++            }
++
++            // Features will be generated now, mark as not pending
++            optimizer.markFeaturesGenerated(pos);
++        }
++        // Tentacles end - Lazy Feature Generation
++
+         Heightmap.primeHeightmaps(
+             chunk,
+             EnumSet.of(Heightmap.Types.MOTION_BLOCKING, Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, Heightmap.Types.OCEAN_FLOOR, Heightmap.Types.WORLD_SURFACE)
+@@ -171,6 +209,28 @@ public class ChunkStatusTasks {
+ 
+     static CompletableFuture<ChunkAccess> light(WorldGenContext worldGenContext, ChunkStep step, StaticCache2D<GenerationChunkHolder> cache, ChunkAccess chunk) {
+         boolean isLighted = isLighted(chunk);
++
++        // Tentacles start - Lighting Deferral
++        // Defer lighting for chunks far from players to reduce generation lag spikes
++        var optimizer = ca.spottedleaf.moonrise.patches.chunk_system.lod.ChunkGenerationOptimizerManager.getForLevel(worldGenContext.level());
++        if (optimizer != null && !isLighted) {
++            ChunkPos pos = chunk.getPos();
++
++            // Check if we should light now or defer
++            if (!optimizer.shouldLightNow(pos)) {
++                // Mark lighting as pending for later computation
++                optimizer.markLightingPending(pos);
++
++                // Return chunk without lighting - it will be lit when player approaches
++                // Chunk is functional but may have incorrect lighting until player gets close
++                return CompletableFuture.completedFuture(chunk);
++            }
++
++            // Lighting will be computed now, mark as done
++            optimizer.markLightingDone(pos);
++        }
++        // Tentacles end - Lighting Deferral
++
+         return worldGenContext.lightEngine().lightChunk(chunk, isLighted);
+     }
+ 
