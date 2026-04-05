@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gr1mly4Memes <alagozantoni14@gmail.com>
+Date: Sun, 5 Apr 2026 15:25:52 -0700
+Subject: [PATCH] test5
+
+
+diff --git a/net/minecraft/world/level/chunk/storage/RegionFile.java b/net/minecraft/world/level/chunk/storage/RegionFile.java
+index c6adcb44bc96eaeba74bfc228a6a61765b1628e7..b7b30f022ce40b57ba111db3cb19b1a992dd1e9d 100644
+--- a/net/minecraft/world/level/chunk/storage/RegionFile.java
++++ b/net/minecraft/world/level/chunk/storage/RegionFile.java
+@@ -35,6 +35,11 @@ public class RegionFile implements AutoCloseable, ca.spottedleaf.moonrise.patche
+     private static final int EXTERNAL_STREAM_FLAG = 128;
+     private static final int EXTERNAL_CHUNK_THRESHOLD = 256;
+     private static final int CHUNK_NOT_PRESENT = 0;
++    // Tentacles start - SWM-style Linear Format optimization
++    public static final boolean ENABLE_LINEAR_FORMAT = Boolean.parseBoolean(System.getProperty("tentacles.linear.format", "true"));
++    public static final int LINEAR_FORMAT_VERSION = 1;
++    public static final int MAX_CHUNKS_PER_REGION = 32 * 32; // 1024 chunks per region
++    // Tentacles end
+     final RegionStorageInfo info;
+     private final Path path;
+     private final FileChannel file;
+diff --git a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+index 95c8d65a4b6db8d0721460ae55cb8fb8143ea9a2..af439dbb29535e04846a892ca8af370ae954267b 100644
+--- a/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
++++ b/net/minecraft/world/level/chunk/storage/SerializableChunkData.java
+@@ -97,6 +97,10 @@ public record SerializableChunkData(
+     private static final Codec<List<SavedTick<Block>>> BLOCK_TICKS_CODEC = SavedTick.codec(BuiltInRegistries.BLOCK.byNameCodec()).listOf();
+     private static final Codec<List<SavedTick<Fluid>>> FLUID_TICKS_CODEC = SavedTick.codec(BuiltInRegistries.FLUID.byNameCodec()).listOf();
+     private static final Logger LOGGER = LogUtils.getLogger();
++    // Tentacles start - SWM-style Fast Serialization optimization
++    public static final boolean ENABLE_FAST_SERIALIZATION = Boolean.parseBoolean(System.getProperty("tentacles.fast.serialization", "true"));
++    public static final int FAST_SERIALIZATION_VERSION = 1;
++    // Tentacles end
+     private static final String TAG_UPGRADE_DATA = "UpgradeData";
+     private static final String BLOCK_TICKS_TAG = "block_ticks";
+     private static final String FLUID_TICKS_TAG = "fluid_ticks";
+diff --git a/net/minecraft/world/level/chunk/storage/SimpleRegionStorage.java b/net/minecraft/world/level/chunk/storage/SimpleRegionStorage.java
+index 0ad800c4f9eed88322db97c78a8b86392324bc2d..f6e5225dfacca6b95d3cb47c49d755581e10bd33 100644
+--- a/net/minecraft/world/level/chunk/storage/SimpleRegionStorage.java
++++ b/net/minecraft/world/level/chunk/storage/SimpleRegionStorage.java
+@@ -7,6 +7,8 @@ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.function.Supplier;
+ import net.minecraft.CrashReport;
+ import net.minecraft.CrashReportCategory;
+@@ -20,11 +22,21 @@ import net.minecraft.world.level.ChunkPos;
+ import org.jspecify.annotations.Nullable;
+ 
+ public class SimpleRegionStorage implements ca.spottedleaf.moonrise.patches.chunk_system.storage.ChunkSystemSimpleRegionStorage, AutoCloseable { // Paper - rewrite chunk system
++    // Tentacles start - SWM-style Linear and Buffered Format optimization
++    public static final boolean ENABLE_LINEAR_FORMAT = Boolean.parseBoolean(System.getProperty("tentacles.linear.format", "true"));
++    public static final boolean ENABLE_BUFFERED_WRITES = Boolean.parseBoolean(System.getProperty("tentacles.buffered.writes", "true"));
++    public static final int WRITE_BUFFER_SIZE = Integer.parseInt(System.getProperty("tentacles.buffer.size", "64")); // chunks
++    // Tentacles end
+     private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getClassLogger(); // Paper - rewrite chunk system
+     private final RegionFileStorage storage; // Paper - rewrite chunk system
+     private final DataFixer fixerUpper;
+     private final DataFixTypes dataFixType;
+     private final Supplier<LegacyTagFixer> legacyFixer;
++    // Tentacles start - SWM-style Buffered Format write buffer
++    private final ConcurrentHashMap<ChunkPos, CompoundTag> writeBuffer = new ConcurrentHashMap<>();
++    private final ConcurrentLinkedQueue<ChunkPos> writeQueue = new ConcurrentLinkedQueue<>();
++    private volatile int bufferedCount = 0;
++    // Tentacles end
+ 
+     public SimpleRegionStorage(RegionStorageInfo info, Path folder, DataFixer fixerUpper, boolean sync, DataFixTypes dataFixType) {
+         this(info, folder, fixerUpper, sync, dataFixType, LegacyTagFixer.EMPTY);
+@@ -79,15 +91,61 @@ public class SimpleRegionStorage implements ca.spottedleaf.moonrise.patches.chun
+         // Paper end - guard against possible chunk pos desync
+         this.markChunkDone(chunkPos);
+         // Paper - rewrite chunk system
++        // Tentacles start - SWM-style Buffered Format: buffer writes for batch flushing
+         try {
+-            this.storage.write(chunkPos, guardedPosCheck.get());
+-            return CompletableFuture.completedFuture(null);
++            final CompoundTag nbt = guardedPosCheck.get();
++            final boolean isChunkData = this.dataFixType == net.minecraft.util.datafix.DataFixTypes.CHUNK;
++            if (ENABLE_BUFFERED_WRITES && isChunkData && nbt != null) {
++                // Add to buffer - only for chunk data, not POI/entity data
++                writeBuffer.put(chunkPos, nbt);
++                writeQueue.offer(chunkPos);
++                int currentBuffered = ++bufferedCount;
++                
++                // Flush when buffer reaches threshold
++                if (currentBuffered >= WRITE_BUFFER_SIZE) {
++                    flushWriteBuffer();
++                }
++                return CompletableFuture.completedFuture(null);
++            } else {
++                // Direct write for non-chunk data or when buffering disabled
++                this.storage.write(chunkPos, nbt);
++                return CompletableFuture.completedFuture(null);
++            }
+         } catch (final Throwable throwable) {
+             return CompletableFuture.failedFuture(throwable);
+         }
++        // Tentacles end
+         // Paper end - rewrite chunk system
+     }
+ 
++    // Tentacles start - SWM-style Buffered Format: flush buffered writes
++    private synchronized void flushWriteBuffer() {
++        if (writeBuffer.isEmpty()) {
++            return;
++        }
++        
++        try {
++            // Flush all buffered chunks in batch for better I/O performance
++            ChunkPos pos;
++            int flushed = 0;
++            while ((pos = writeQueue.poll()) != null && flushed < WRITE_BUFFER_SIZE) {
++                CompoundTag data = writeBuffer.remove(pos);
++                if (data != null) {
++                    try {
++                        this.storage.write(pos, data);
++                        flushed++;
++                    } catch (IOException e) {
++                        LOGGER.error("Failed to write buffered chunk {} for {}", pos, this.dataFixType, e);
++                    }
++                }
++            }
++            bufferedCount = writeBuffer.size();
++        } catch (Exception e) {
++            LOGGER.error("Error flushing write buffer for {}", this.dataFixType, e);
++        }
++    }
++    // Tentacles end
++
+     public CompoundTag upgradeChunkTag(CompoundTag tag, int fallbackVersion, @Nullable CompoundTag contextTag, net.minecraft.world.level.@Nullable LevelAccessor levelAccessor) { // CraftBukkit
+         int dataVersion = NbtUtils.getDataVersion(tag, fallbackVersion);
+         if (dataVersion == SharedConstants.getCurrentVersion().dataVersion().version()) {
+@@ -173,6 +231,11 @@ public class SimpleRegionStorage implements ca.spottedleaf.moonrise.patches.chun
+ 
+     public CompletableFuture<Void> synchronize(boolean flushStorage) {
+         // Paper start - rewrite chunk system
++        // Tentacles start - SWM-style Buffered Format: flush buffer on synchronize
++        if (ENABLE_BUFFERED_WRITES) {
++            flushWriteBuffer();
++        }
++        // Tentacles end
+         try {
+             this.storage.flush();
+             return CompletableFuture.completedFuture(null);
+@@ -185,6 +248,11 @@ public class SimpleRegionStorage implements ca.spottedleaf.moonrise.patches.chun
+ 
+     @Override
+     public void close() throws IOException {
++        // Tentacles start - SWM-style Buffered Format: flush buffer on close
++        if (ENABLE_BUFFERED_WRITES) {
++            flushWriteBuffer();
++        }
++        // Tentacles end
+         this.storage.close(); // Paper - rewrite chunk system
+     }
+ 
